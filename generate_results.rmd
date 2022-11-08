@@ -1,0 +1,319 @@
+---
+title: "Volumetric Network Meta Results"
+output:
+  word_document: default
+  html_notebook: default
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE)
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+library(magick)
+library(metafor)
+library(tidyverse)
+library(scales)
+library(googlesheets4)
+library(netmeta)
+library(ggpubr)
+library(PRISMAstatement)
+library(knitr)
+library(gridExtra)
+library(gridGraphics)
+library(crop)
+library(png)
+library(RColorBrewer)
+library(gplots)
+library(igraph)
+library(readr) 
+library(jpeg)
+library(grid)
+library(psych)
+source('./netmeta_funcs.r')
+
+# Select whether diagnoses
+selected_grouping = 'diagnosis_grouped'
+enigma <-  'no'
+suffix2=''
+
+regions <- c('whole_brain','intracranial','white_matter', 'gray_matter', 'csf', 'amygdala', 'acc', 'accumbens', 'caudate','cerebellum', 'corpus_callosum', 'frontal', 'hippocampus', 'insula', 'lateral_ventricle', 'pallidum', 'parahippocampal',  'putamen', 'temporal', 'thalamus', 'third_ventricle')
+
+# Read in  google sheet and save to cleaned_data.csv
+df <- get_data()
+df <- read_csv('../data/cleaned_data.csv')
+
+
+#if including enigma
+if (enigma == 'yes'){
+  suffix <- 'YES_enigma'
+  df <- df %>% filter(is.na(enigma_overlap))}
+
+if (enigma == 'no'){
+  suffix <- 'NO_enigma'
+  df <- df %>% filter(is.na(enigma_study))}
+
+#remove if nan row
+df <- df %>% filter(diagnosis!='NaN')
+
+#remove if nan age
+df <- df %>% filter(age!='NaN')
+df <- df %>% filter(male_percent!='NaN')
+
+df_fixed <- fix_data(df, grouping = selected_grouping, enigma)
+
+df <- remove_ageunmatched(remove_ageunmatched(df_fixed))
+df <- df[df$age>18,]
+df <- remove_sexunmatched(remove_sexunmatched(remove_sexunmatched(df))) #need to run sex matching a few times
+
+# check no columns lists
+for(col in colnames(df)){
+  if(class(df[[col]])=='list'){
+    print(col)}
+}
+
+saveRDS(df, file=paste0('../results/main_meta_result/df_', suffix, suffix2, '.rds'))
+
+
+#check duplicate extractions
+check=c()
+for (title1 in unique(df$title)){
+  a <- df %>% filter(title==title1)
+  if(length(unique(a$researcher))!=1){
+    check <- c(check, title1)
+  }
+}
+
+for(study in unique(df$studyid)){
+  singledf <- df %>%  filter(studyid==study)
+  if(nrow(singledf)==1){print(study)}
+}
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, results='hide'}
+# Run meta
+meta_list = list()
+plot_list = list()
+heatmap_list = list()
+i=1
+
+main_man_regions <- c(  'gray_matter','white_matter','lateral_ventricle','cerebellum','corpus_callosum', 'frontal', 'acc', 'insula','temporal', 'parahippocampal','hippocampus', 'amygdala', 'accumbens', 'caudate','putamen','pallidum', 'thalamus')
+
+#network_graphs
+for(region in main_man_regions){
+  # Create network suitable format
+  title <- amend_title(region)
+  net_data <- get_net_data(region, df, grouping=selected_grouping)
+  mn0 <- netmeta(TE=TE, seTE=seTE, treat1=diagnosis1, treat2=diagnosis2, studlab=studyid, data=net_data, sm="SMD", 
+                 tol.multiarm=0.5, tol.multiarm.se=0.2, details.chkmultiarm = TRUE)
+  meta_list[[i]] <- mn0
+
+  # save cropped network graph
+  filename <- paste0('../results/network_graphs/',region,suffix,suffix2,'.png', sep='')
+  png(file=(file <- filename), width = 400, height = 400)
+  netgraph(mn0,plastic=0,offset = 0.03,thickness='number.of.studies',dim=1,points=2, 
+           alpha.transparency = 0, main=title, cex.main=2, cex = 1.5)
+  dev.off.crop(file=file)
+
+  #forest plot, order by effect size and remove control lozenge
+  a <- summary(mn0)
+  idx<- rev(sort(a$random$TE[,'CON'], index.return=TRUE)$ix)
+  control_idx <- which(names(a$random$TE[,'CON'])=='CON')
+  idx <- idx[idx!=control_idx]
+  graph_results <- data.frame(estimate=a$random$TE[,'CON'][idx], lb=a$random$lower[,'CON'][idx],
+                              ub=a$random$upper[,'CON'][idx],label=factor(colnames(a$random$TE)[idx], colnames(a$random$TE)[idx]))
+  if(suffix2=='_clus'){
+    graph_results <- data.frame(estimate=a$random$TE[,'CON'], lb=a$random$lower[,'CON'],
+                              ub=a$random$upper[,'CON'],label=factor(colnames(a$random$TE), colnames(a$random$TE))) %>% filter(label!='CON')}
+  plot_list[[i]] <- forestplot(graph_results, title)
+  heatmap_list[[i]]<- effect_heatmap(mn0, title)
+  i=i+1
+}
+
+
+saveRDS(plot_list, paste0(file='../results/main_meta_result/plot_list_', suffix, suffix2, '.rds'))
+saveRDS(meta_list, paste0(file='../results/main_meta_result/meta_list_', suffix, suffix2, '.rds'))
+saveRDS(heatmap_list, paste0(file='../results/main_meta_result/heatmap_list_', suffix, suffix2, '.rds'))
+
+```
+
+# SMD heatmap
+```{r}
+smd_df_long <- data.frame(Region=character(), Diagnosis = character(), d=numeric())
+for(i in c(1:length(main_man_regions))){
+  a <- meta_list[[i]]
+  b <- data.frame(a$TE.random)
+  smd_df_long <- rbind(smd_df_long, data.frame(d=b$CON, Diagnosis=rownames(b), Region=main_man_regions[i]))
+}
+smd_df_long$Region <- smd_df_long$Region %>% 
+  plyr::revalue(c("acc" = "Anterior Cingulate", "frontal"="Frontal lobe",
+                  'parahippocampal'='Parahippocampal Gyrus', 'temporal'='Temporal Lobe'))
+smd_df_long$Region <- str_to_title(sub("_", " ", smd_df_long$Region))
+smd_df_long$Region <- factor(smd_df_long$Region, levels = c('Gray Matter', 'White Matter', 'Lateral Ventricle', 'Cerebellum', 'Corpus Callosum', 'Frontal Lobe', 'Anterior Cingulate', 'Insula', 'Temporal Lobe', 'Parahippocampal Gyrus', 'Hippocampus', 'Amygdala', 'Accumbens',  'Caudate', 'Putamen', 'Pallidum', 'Thalamus'))
+
+smd_df_long <- smd_df_long %>% filter(Diagnosis!='CON')
+smd_df <- smd_df_long %>% pivot_wider(id_cols = 'Region', names_from = 'Diagnosis', values_from = 'd')
+smd_df_long <- smd_df %>% pivot_longer(!Region, names_to= 'Diagnosis', values_to='d') 
+smd_df3<- smd_df %>% select(where(function(x) sum(!is.na(x)) > 3))
+smd_df3<- smd_df3[,!(names(smd_df3) %in% c('Region'))]
+cor_df <- cor(smd_df3, use='pairwise.complete.obs')
+
+saveRDS(smd_df_long, paste0(file='../results/main_meta_result/', 'smd_df_long', suffix, suffix2, '.rds'))
+saveRDS(smd_df3, paste0(file='../results/main_meta_result/', 'smd_df3', suffix, suffix2, '.rds'))
+
+```
+
+PCA analysis
+```{r}
+library(BiocManager)
+library(pcaMethods)
+library(ggh4x)
+
+# Perform PCA
+result <- pcaMethods::pca(as.matrix(smd_df3), method="ppca", nPcs=4)
+df_pca <- data.frame(result@loadings)
+
+# Order according to first component
+df_pca <- df_pca[order(df_pca$PC1),]
+df_pca <- cbind(Diagnosis = rownames(df_pca), df_pca)
+df_pca$Diagnosis <- factor(df_pca$Diagnosis, levels = df_pca$Diagnosis )
+df_pca_long <- df_pca %>% pivot_longer(!Diagnosis, names_to= 'PC', values_to='Loading')
+
+# Plot pca by diagnosis
+df_pca_long %>% ggplot(aes(x=PC, y=Diagnosis, fill=Loading))+geom_tile()+scale_fill_gradient2(low = "tomato",mid='white', high = "seagreen", limits=center_limits())+theme_minimal()+
+theme(axis.text.x=element_text(angle=45,hjust=1))+ggtitle('A')+xlab('Component')
+
+```
+
+
+
+# Supplementary materials
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+regions <- c(  'gray_matter','white_matter','lateral_ventricle','cerebellum','corpus_callosum', 'frontal', 'acc', 'insula','temporal', 'parahippocampal','hippocampus', 'amygdala', 'accumbens', 'caudate','putamen','pallidum', 'thalamus')
+
+meta_df <- data.frame(study_id=character(), n1=numeric(), m1=numeric(), sd1=numeric(), n2=numeric(), m2=numeric(), sd2=numeric(), diag1=character(), diag2=character(), region=character())
+for(region in regions){
+  print(region)
+  for(diag1 in unique(df$diagnosis_grouped)){
+    print(diag1)
+    for(diag2 in unique(df$diagnosis_grouped)){
+      if(diag1==diag2){next}
+      for (study in unique(df$studyid)){
+        single_study_df <- df %>% filter(studyid==study)
+        if((diag1 %in% single_study_df$diagnosis_grouped) && (diag2 %in% single_study_df$diagnosis_grouped)){
+          diag1_df <- single_study_df %>% filter(diagnosis_grouped==diag1)
+          diag2_df <- single_study_df %>% filter(diagnosis_grouped==diag2)
+          age_comb <- (diag1_df$age*diag1_df$n+diag2_df$age*diag2_df$n)/(diag1_df$n + diag2_df$n)
+          sex_comb <- (diag1_df$male_percent*diag1_df$n+diag2_df$male_percent*diag2_df$n)/(diag1_df$n + diag2_df$n)
+          meta_df <- rbind(data.frame(studyid=diag1_df$studyid, n1=diag1_df$n, m1=diag1_df[paste0(region, '_mn')][[1]], sd1=diag1_df[paste0(region, '_sd')][[1]],
+                                                   n2=diag2_df$n, m2=diag2_df[paste0(region, '_mn')][[1]], sd2=diag2_df[paste0(region, '_sd')][[1]], diag1=diag1, diag2=diag2, region=region, age=age_comb, sex=sex_comb), meta_df)
+          if(class(meta_df[1])=='list'){break}
+        }
+      }
+    }
+  }
+}
+saveRDS(meta_df, file='../results/pairwise_meta.rds')
+
+meta_df <- readRDS(file='../results/pairwise_meta.rds')
+meta_df <- meta_df %>% filter(sd1>0) %>% filter(sd2>0)
+meta_df <- escalc(measure='SMD',n1=n1, m1=m1, sd1=sd1, n2=n2, m2=m2, sd2=sd2, data = meta_df)
+i2list <- list()
+egger_list <- list()
+
+#the diagnosis listed in the title first is the tone on the right hand side i.e. if diagnosis listed first is bigger lozenge will be >0
+a <- data.frame(t(combn(unique(df$diagnosis_grouped), 2)))
+for(reg in regions){
+  for(i in c(1:nrow(a))){
+    diag1var=as.character(a[i,1])
+    diag2var=as.character(a[i,2])
+    title <- amend_title(reg)
+    region_df <- meta_df %>% filter((region==reg)&(diag1==diag1var)&(diag2==diag2var))
+    if(nrow(region_df)>2){
+      meta_results <- rma.uni(yi,vi,data=region_df,method='REML', slab=studyid,control=list(maxiter=10000, stepadj=0.5) )
+      i2list[[paste0(reg,'_',diag1var,'_',diag2var)]] <- meta_results$I2
+      png(paste0('../results/pairwise/', reg,'_',diag1var,'_',diag2var, '_forest.png'), res=300,width=6, height=4, units='in')
+      forest(meta_results, addpred=TRUE, main=paste0(diag1var, " vs ", diag2var," ", title,
+             ' (I2=',round(meta_results$I2, 0), '%, ', 'tau=', signif(meta_results$tau2, 2), ')'),
+             xlim = c(-3.5,3.5),
+             alim = c(-1.5,1.5),
+             refline=NA,ylim=c(-1.5, meta_results$k+0.5))
+      abline(h=meta_results$k-1.5, lwd=1.5, col="white")
+      abline(v=0)
+      dev.off()
+      if(nrow(region_df)>9){
+        regtest_res <- regtest(meta_results)
+        png(paste0('../results/pairwise/', reg,'_',diag1var,'_',diag2var,'_funnel.png'), res=200,width=5, height=4, units='in')
+        funnel(meta_results,level=c(90, 95, 99), shade=c("white", "gray55", "gray75"))
+        title(paste0("Egger's test z=",signif(regtest_res$zval, digits=2), " p=",signif(regtest_res$pval, digits=2)))
+        egger_list[[paste0(reg,'_',diag1var,'_',diag2var)]] <- signif(regtest_res$pval, digits=2)
+        dev.off()}
+      if(nrow(region_df)<10){
+        png(paste0('../results/pairwise/', reg,'_',diag1var,'_',diag2var,'_funnel.png'), res=200,width=5, height=4, units='in')
+        plot.new()
+        dev.off()}
+
+    }
+  }
+}
+
+saveRDS(egger_list, file='../results/egger_list.rds')
+saveRDS(i2list, file='../results/i2list.rds')
+
+
+# make individual pages
+forestfiles <-list.files(path = "../results/pairwise/", recursive = FALSE, pattern = "forest.png$", full.names = T)
+funnelfiles <-list.files(path = "../results/pairwise/", recursive = FALSE, pattern = "funnel.png$", full.names = T)
+num_pages <- ceiling(length(funnelfiles)/2)
+
+for(i in c(1:num_pages)){
+  for_f <- c(forestfiles[(2*i-1)], funnelfiles[(2*i-1)], forestfiles[2*i], funnelfiles[2*i])
+  if(i==num_pages){for_f <- na.omit(for_f)}
+        magick::image_read(for_f) %>% 
+        magick::image_montage(tile = "2", geometry = "x1000+20+100") %>%
+        # magick::image_convert("jpg") %>%
+        # magick::image_resize("4000") %>% 
+        magick::image_write(
+          format = "png", path = paste0('../results/pairwise/forest' ,str_pad(i, 3, pad='0'),'collage.png')) 
+  }
+
+#join into single pdf
+lf = list.files(path = "../results/pairwise/",recursive = FALSE,pattern = "collage.png",full.names = T)
+jpegs = lapply(lf, readPNG)
+pdf("../results/pairwise/output.pdf", width=8, height=4)
+grid.raster(jpegs[[1]])
+lapply(jpegs[-1], function(x) {grid.newpage() ; grid.raster(x)} ) -> bquiet
+dev.off()
+
+
+#meta regressions
+highI2 <- c()
+adjustI2 <- c()
+sigmod <- c()
+for(reg in regions){
+  for(i in c(1:nrow(a))){
+    diag1var=as.character(a[i,1])
+    diag2var=as.character(a[i,2])
+    title <- amend_title(reg)
+    region_df <- meta_df %>% filter((region==reg)&(diag1==diag1var)&(diag2==diag2var)) %>% filter
+    test_df <- region_df %>% filter(age>0) %>% filter(sex>0)
+    if(sum(test_df$sex>0, na.rm=T)>5){
+      i2list[[paste0(reg,'_',diag1var,'_',diag2var)]] <- meta_results$I2
+      meta_results <- rma.uni(yi,vi,data=region_df,method='REML', slab=studyid,control=list(maxiter=10000, stepadj=0.5))
+      adjust_meta_results <- rma.uni(yi,vi,data=region_df,method='REML', slab=studyid,control=list(maxiter=10000, stepadj=0.5), mods=~sex+age )
+      highI2 <- c(highI2, meta_results$I2>75)
+      adjustI2 <- c(adjustI2, adjust_meta_results$I2>75)
+      sigmod <- c(sigmod, (sum(adjust_meta_results$pval[c(2,3)]<0.05)>0))
+
+    }
+  }
+}
+
+meta_reg_data <- list(highI2=highI2, adjustI2=adjustI2, sigmod=sigmod)
+saveRDS(meta_reg_data, file='../results/meta_reg_data.rds')
+
+```
